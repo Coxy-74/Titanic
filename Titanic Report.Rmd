@@ -1,0 +1,672 @@
+
+```{r getdate, echo = FALSE}
+docdate <- format(Sys.Date(),"%d %b %Y")
+```
+
+---
+title: "Titanic Survivor Analysis"
+author: "Simon Cox, `r docdate`"
+output: 
+  html_document:
+    toc: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(include = FALSE)
+knitr::opts_chunk$set(cache = TRUE)
+shhh <- suppressPackageStartupMessages 
+shhh(library(caret))
+shhh(library(ggplot2))
+shhh(library(dplyr))
+shhh(library(gridExtra))
+shhh(library(formattable))
+```
+
+```{r get_data}
+df_pass <- read.csv("train.csv")
+```
+
+```{r preprocess_data}
+# Remove outlier (large fare)
+# df_pass <- df_pass[df_pass$Fare < 400,]
+
+# Update missing values for Embarkation point
+df_pass$Embarked[df_pass$Embarked == ""] <- "C"
+df_pass$Embarked <- as.factor(as.character(df_pass$Embarked))
+
+# Combine siblings and parent/child columns into single "family size" column
+df_pass$FamSize <- df_pass$SibSp + df_pass$Parch
+
+# Remove Name, Passenger Id, Ticket, SibSp, Parch and Cabin columns
+df_pass <- df_pass[,-c(1,4,7,8,9,11)]
+
+# Split into training and test data
+set.seed(2903)
+trainRowNumbers <- createDataPartition(df_pass$Survived, p = 0.7, list = FALSE)
+df_train <- df_pass[trainRowNumbers,]
+df_test <- df_pass[-trainRowNumbers,]
+
+# Store Survived value for later use
+train_y <- as.data.frame(list(as.factor(df_train$Survived)), col.names = c("Survived"))
+test_y <- as.data.frame(list(as.factor(df_test$Survived)), col.names = c("Survived"))
+
+# Impute missing rows
+missingDataModel <- preProcess(df_train[,-1],method='bagImpute')
+
+# Data Transformations (training data)
+  # Missing values
+    df_train <- predict(missingDataModel, newdata = df_train[,-1])
+  # Categorical features to numeric features
+    ohe_model <- dummyVars(~ ., data = df_train)
+    df_train <- data.frame(predict(ohe_model, newdata = df_train))
+  # Centre and Scale data
+    scale_model <- preProcess(df_train, method = c("center","scale"))
+    df_train <- predict(scale_model, newdata = df_train)
+
+# Data Transformations (test data)
+df_test <- predict(missingDataModel, newdata = df_test[,-1])
+df_test <- data.frame(predict(ohe_model, newdata = df_test))
+df_test <- predict(scale_model, newdata = df_test)
+
+```
+
+
+## Executive Summary
+
+This document presents the results of an analysis done on various items of data pertaining to passengers aboard the Titanic, and whether the passenger survived or not. Data from 891 passengers was provided via the Kaggle website.  
+<cr>
+The goal of the analysis is to generate a predictive supervised machine learning model to ascertain the probability that a passenger would survive or not. This can then be tested against a set of data again provided via the Kaggle website and submitted for scoring within a public competition, where the results are scored in terms of overall accuracy. The analysis presented in this document is only concerned with finding the best model given the initial set of data. The best accuracy score was achieved by using the XGBoost (Extreme Gradient Boosting) algorithm.  
+<cr>
+Whilst the final model is not easily interpretable, the following features are the most important when determining the probability that a passenger survived:  
+* Sex (Female) - A much higher proportion of women than men survived.  
+* Fare - A noticeable trend exists in the data in that the higher the fare paid, the more likely the passenger survived.  
+* Age - A noticeable trend exists in the data in that the higher the passenger's age, the less likely the passenger survived.  
+* Passenger Class - Passenger Class 1 had the highest survival rate, followed by Passenger Class 2. Passenger Class 3 had the lowest survival rate.  
+* Family Size - Families with 3 parents / children / siblings had the highest survival rate.  
+
+## Exploratory Data Analysis  
+
+The initial dataset contained the following features pertaining to passengers on the Titanic:  
+
+|Feature      |Description                                 |Key                                           |
+|-------------|--------------------------------------------|----------------------------------------------|
+|survival	    |Survival	                                   |0 = No, 1 = Yes                               |
+|pclass	      |Ticket class	                               |1 = 1st, 2 = 2nd, 3 = 3rd                     |
+|sex	        |Sex	                                       |                                              |
+|Age	        |Age in years                                |                                              |
+|sibsp	      |# of siblings / spouses aboard the Titanic	 |                                              |
+|parch	      |# of parents / children aboard the Titanic	 |                                              |
+|ticket	      |Ticket number	                             |                                              |
+|fare	        |Passenger fare	                             |                                              |
+|cabin	      |Cabin number	                               |                                              |
+|embarked	    |Port of Embarkation	                       |C = Cherbourg, Q = Queenstown, S = Southampton|
+  
+  
+An early assumption is that the "ticket" and "cabin" features are to be ignored for the analysis. In addition, a new feature called "Family Size" can be created by summing the "sibsp" and "parch" features.  
+  
+An analysis of the distribution of survivors shows variation of survivor numbers amongst the values of all remaining features, suggesting that they may be important enough to include in any predictive model.
+
+```{r survivors, include = TRUE, fig.width = 9}
+df_survived <- df_pass[df_pass$Survived == 1,]
+par(mfrow = c(2,3))
+barplot(table(df_survived$Pclass), col = "steelblue", main = "Survivors by Pclass")
+barplot(table(df_survived$Sex), col = "steelblue", main = "Survivors by Sex")
+hist(df_survived$Age,col = "steelblue", main = "Survivors by Age", xlab = "", ylab = "")
+barplot(table(df_survived$FamSize), col="steelblue",main = "Survivors by Family Size")
+hist(df_survived$Fare,col = "steelblue", main = "Survivors by Fare", xlab = "", ylab = "")
+barplot(table(df_survived$Embarked), col="steelblue",main = "Survivors by Embarked")
+```
+
+If we look at the percentage of survivors for each feature, we see that the two main factors in survival 
+appear to be sex and passenger class (Pclass). It is also interesting that there is an upward trend in the survival rate and the fare paid but overall each of the features appears to have an influence on the chances of survival.
+
+```{r pct_survivors, include = TRUE, fig.width = 9}
+# Look at survivors by Pclass
+Pclass_survivors <- df_pass %>%
+                      group_by(Pclass) %>%
+                      summarise(tot = n(),
+                                tot_survived = sum(Survived)) %>%
+                      mutate(pct_survived = tot_survived / tot * 100)
+
+pclass_plot <- ggplot(Pclass_survivors,aes(Pclass,pct_survived)) +
+               geom_bar(stat = "identity", fill = "darkgreen") + 
+               theme(axis.title.x = element_blank(), 
+                     axis.title.y = element_blank(),
+                     plot.title = element_text(hjust = 0.5)) + 
+               ggtitle("% Survived by Pclass")
+
+# Look at survivors by Sex
+Sex_survivors <- df_pass %>%
+                   group_by(Sex) %>%
+                   summarise(tot = n(),
+                             tot_survived = sum(Survived)) %>%
+                   mutate(pct_survived = tot_survived / tot * 100)
+
+sex_plot <- ggplot(Sex_survivors,aes(Sex,pct_survived)) +
+            geom_bar(stat = "identity", fill = "darkgreen") + 
+            theme(axis.title.x = element_blank(), 
+                  axis.title.y = element_blank(),
+                  plot.title = element_text(hjust = 0.5)) + 
+            ggtitle("% Survived by Sex")
+
+# Look at survivors by Age
+Age_survivors <- df_pass %>%
+                   mutate(AgeRange = cut(df_pass$Age, 
+                                         c(0,10,20,30,40,50,60,70,100),
+                                         labels = c("0-10", "11-20", "21-30", "31-40", "41-50", 
+                                                    "51-60", "61-70", "70+"))) %>%
+                   group_by(AgeRange) %>%
+                   summarise(tot = n(),
+                             tot_survived = sum(Survived)) %>%
+                   mutate(pct_survived = tot_survived / tot * 100)
+
+age_plot <- ggplot(Age_survivors,aes(AgeRange,pct_survived)) +
+            geom_bar(stat = "identity", fill = "darkgreen") + 
+            theme(axis.title.x = element_blank(), 
+                  axis.title.y = element_blank(),
+                  plot.title = element_text(hjust = 0.5)) + 
+            ggtitle("% Survived by Age Range")
+
+# Look at survivors by Fare
+Fare_survivors <- df_pass %>%
+                    mutate(FareRange = cut(df_pass$Fare, 
+                                           c(-1,10,20,30,50,100,300),
+                                           labels = c("0-10", "11-20", "21-30", "31-50", "50-100", "101+"))) %>%
+                    group_by(FareRange) %>%
+                    summarise(tot = n(),
+                              tot_survived = sum(Survived)) %>%
+                    mutate(pct_survived = tot_survived / tot * 100)
+
+fare_plot <- ggplot(Fare_survivors,aes(FareRange,pct_survived)) +
+             geom_bar(stat = "identity", fill = "darkgreen") + 
+             theme(axis.title.x = element_blank(), 
+                   axis.title.y = element_blank(),
+                   plot.title = element_text(hjust = 0.5)) + 
+             ggtitle("% Survived by Fare Range")
+
+# Look at survivors by Embarked
+Embarked_survivors <- df_pass %>%
+                        group_by(Embarked) %>%
+                        summarise(tot = n(),
+                                  tot_survived = sum(Survived)) %>%
+                        mutate(pct_survived = tot_survived / tot * 100)
+
+embarked_plot <- ggplot(Embarked_survivors,aes(Embarked,pct_survived)) +
+                 geom_bar(stat = "identity", fill = "darkgreen") + 
+                 theme(axis.title.x = element_blank(), 
+                       axis.title.y = element_blank(),
+                       plot.title = element_text(hjust = 0.5)) + 
+                 ggtitle("% Survived by Embarked")
+
+# Look at survivors by Family Size
+FamSize_survivors <- df_pass %>%
+                       mutate(FamSizeRange = cut(df_pass$FamSize, 
+                                                 c(-1,0,1,2,3,4,20),
+                                                 labels = c("0", "1", "2", "3", "4", "5+"))) %>%
+                       group_by(FamSizeRange) %>%
+                       summarise(tot = n(),
+                                 tot_survived = sum(Survived)) %>%
+                       mutate(pct_survived = tot_survived / tot * 100)
+
+famsize_plot <- ggplot(FamSize_survivors,aes(FamSizeRange,pct_survived)) +
+                geom_bar(stat = "identity", fill = "darkgreen") + 
+                theme(axis.title.x = element_blank(), 
+                      axis.title.y = element_blank(),
+                      plot.title = element_text(hjust = 0.5)) + 
+                ggtitle("% Survived by Family Size")
+
+grid.arrange(grobs = list(pclass_plot, 
+                          sex_plot,
+                          age_plot,
+                          fare_plot,
+                          embarked_plot,
+                          famsize_plot)
+             , nrow = 2)
+
+```
+
+The features can be divided into categorical features and continuous numeric features:  
+
+* Categorical:  
+  + Pclass  
+  + Sex  
+  + Embarked  
+* Numeric:  
+  + Age  
+  + Fare  
+  + Family Size  
+  
+It is worthwhile looking at the relationships between the numeric features to see if there is any evidence
+of multicolinearity - i.e. a strong correlation between any of them. This is important because multicolinearity
+can distort the final model; if two features are highly correlated then it is better to only include one of them
+in the model.  
+The first step is to look at the scatterplots between them:  
+
+```{r scatterplots, include = TRUE, fig.width = 9}
+age_vs_fare <- ggplot(df_pass, aes(Age, Fare)) + 
+    geom_jitter(colour = "purple") +
+    ggtitle("Age vs Fare") +
+    theme(plot.title = element_text(hjust = 0.5))
+
+age_vs_famsize <- ggplot(df_pass, aes(FamSize,Age)) + 
+    geom_jitter(colour = "purple") +
+    ggtitle("Family Size vs Age") +
+    theme(plot.title = element_text(hjust = 0.5))
+
+fare_vs_famsize <- ggplot(df_pass, aes(FamSize, Fare)) + 
+    geom_jitter(colour = "purple") +
+    ggtitle("Family Size vs Fare") +
+    theme(plot.title = element_text(hjust = 0.5))
+
+grid.arrange(age_vs_fare,
+             age_vs_famsize,
+             fare_vs_famsize,
+             nrow = 1)
+```
+
+It appears that there is not a lot of correlation between these variables from the scatterplots. The next check is to look at the correlation coefficients, and as suspected by the scatterplots there are no strong relationships:
+
+```{r correlation, include = TRUE}
+cor_age_fare <- cor(df_pass$Age, df_pass$Fare, method = "pearson")
+cor_age_famsize <- cor(df_pass$Age, df_pass$FamSize, method = "pearson")
+cor_fare_famsize <- cor(df_pass$Fare, df_pass$FamSize, method = "pearson")
+```
+
+* Age vs Fare: `r cor_age_fare` 
+* Family Size vs Age: `r cor_age_famsize`  
+* Family Size vs Fare: `r cor_fare_famsize`  
+  
+This means that we are happy to include all six features in the model.
+
+### Data Transformations  
+There are a few steps to complete before generating a model:  
+
+* Impute values for records with missing data using the "bagImpute" method in the caret package. 
+* Feature engineering - a new feature was created called "Family Size" that simply summed the number of siblings and number of parents / children fields.
+* Split into training and test datasets.  
+  + In this instance we will split the data such that 70% is used to train the model and 30% is used to test it.  
+* Transform categorical features into numeric features.  
+  + E.g. create 2 new columns "Male" and "Female", and give the relevant columns values of 1 or zero.  
+* Scale the features so that we don't get a feature such as Fare dominating the model.  
+
+### Feature Importance
+One last thing to check before launching into a model is the feature importance, now that we have completed all of the preprocessing on the data. The recursive feature elimination function in R can give us an indication of which of the features in the model are most important, and how many features we should potentially use. The output of this function is shown below:
+
+```{r, feature_importance, include = TRUE}
+set.seed(2903)
+options(warn = -1)
+ctrl <- rfeControl(functions = rfFuncs, method = "repeatedcv", repeats = 5, verbose = FALSE)
+lmProfile <- rfe(x = df_train, y = train_y$Survived, sizes = c(1:9), rfeControl = ctrl)
+lmProfile
+```
+
+As we can see, the most important features in determining whether one survived are Age, Passenger Class, Sex and the Fare paid, and this makes logical sense. It also seems that perhaps the best model will not involve all 9 features.
+
+## Machine Learning Models  
+### Logistic Regression   
+The first model to try is the Logistic Regression model. This model is useful because the coefficients generated within the model make it somewhat interpretable. In the first instance we will use all features to generate the model and the resulting coefficients are shown below:
+
+```{r logistic_regression_1, include = TRUE}
+set.seed(2903)
+options(warn = -1)
+model_glm <- train(Survived ~ ., 
+                   data = bind_cols(train_y,df_train), 
+                   method = "glm", 
+                   family = "binomial")
+
+model_glm$finalModel$coefficients
+
+df_train_predicted <- predict(model_glm,df_train)
+cm_glm_train <- confusionMatrix(data = df_train_predicted, 
+                                reference = train_y$Survived,
+                                mode = "everything",
+                                positive = "1")
+
+df_test_predicted <- predict(model_glm,df_test)
+cm_glm_test <- confusionMatrix(data = df_test_predicted, 
+                               reference = test_y$Survived,
+                               mode = "everything",
+                               positive = "1")
+```
+
+The Accuracy for this model against both the training and testing datasets is shown below and this provides an OK result.  
+
+|Dataset      |Accuracy|
+|-------------|--------|
+|Training     |`r cm_glm_train$overall[[1]]`|
+|Testing      |`r cm_glm_test$overall[[1]]`|
+
+However we suspect that using all 9 features may not be the best model, so we can look at the variable importance:
+
+```{r varImp_1, include = TRUE}
+varimp_glm <- varImp(model_glm)
+plot(varimp_glm, main = "Variable Importance - Logistic Regression (all features)")
+```
+
+Indeed, it seems that the most important features are Sex, Passenger Class, Age and Family Size. Surprisingly the Fare feature is not so important. Therefore we will attempt new models with just the four most important features and compare accuracies.
+
+```{r logistic_regression_2}
+set.seed(2903)
+options(warn = -1)
+model_glm_1 <- train(Survived ~ Sex.female, 
+                     data = bind_cols(train_y,df_train), 
+                     method = "glm", 
+                     family = "binomial")
+df_test_predicted <- predict(model_glm_1,df_test)
+cm_glm_1 <- confusionMatrix(data = df_test_predicted, 
+                          reference = test_y$Survived,
+                          mode = "everything",
+                          positive = "1")
+set.seed(2903)
+options(warn = -1)
+model_glm_2 <- train(Survived ~ Sex.female + Pclass, 
+                     data = bind_cols(train_y,df_train), 
+                     method = "glm", 
+                     family = "binomial")
+df_test_predicted <- predict(model_glm_2,df_test)
+cm_glm_2 <- confusionMatrix(data = df_test_predicted, 
+                          reference = test_y$Survived,
+                          mode = "everything",
+                          positive = "1")
+
+set.seed(2903)
+options(warn = -1)
+model_glm_3 <- train(Survived ~ Sex.female + Pclass + Age, 
+                     data = bind_cols(train_y,df_train), 
+                     method = "glm", 
+                     family = "binomial")
+df_train_predicted <- predict(model_glm_3,df_train)
+cm_glm_3_train <- confusionMatrix(data = df_train_predicted, 
+                                  reference = train_y$Survived,
+                                  mode = "everything",
+                                  positive = "1")
+df_test_predicted <- predict(model_glm_3,df_test)
+cm_glm_3_test <- confusionMatrix(data = df_test_predicted, 
+                                 reference = test_y$Survived,
+                                 mode = "everything",
+                                 positive = "1")
+set.seed(2903)
+options(warn = -1)
+model_glm_4 <- train(Survived ~ Sex.female + Pclass + Age + FamSize, 
+                     data = bind_cols(train_y,df_train), 
+                     method = "glm", 
+                     family = "binomial")
+df_train_predicted <- predict(model_glm_4,df_train)
+cm_glm_4_train <- confusionMatrix(data = df_train_predicted, 
+                                  reference = train_y$Survived,
+                                  mode = "everything",
+                                  positive = "1")
+df_test_predicted <- predict(model_glm_4,df_test)
+cm_glm_4_test <- confusionMatrix(data = df_test_predicted, 
+                                 reference = test_y$Survived,
+                                 mode = "everything",
+                                 positive = "1")
+```
+
+|Features in Model                         |Accuracy|
+|------------------------------------------|--------|
+|Sex                                       |`r cm_glm_1$overall[[1]]`|
+|Sex + Passenger Class                     |`r cm_glm_2$overall[[1]]`|
+|Sex + Passenger Class + Age               |`r cm_glm_3_test$overall[[1]]`|
+|Sex + Passenger Class + Age + Family Size |`r cm_glm_4_test$overall[[1]]`|  
+
+It turns out the model with 3 features gives the highest accuracy for logistic regression. The coefficients for the selected model are shown below:
+
+```{r logistic_coefficients, include = TRUE}
+model_glm_3$finalModel$coefficients
+```
+
+Finally we can compare the accuracy of the training dataset against the testing dataset; a small discrepancy will indicate a good model.  
+
+|Dataset      |Accuracy|
+|-------------|--------|
+|Training     |`r cm_glm_3_train$overall[[1]]`|
+|Testing      |`r cm_glm_3_test$overall[[1]]`|
+
+The small discrepancy in the figures above, and the fact that the accuracy of the testing data is higher than the accuracy of the training data indicates that the model is solid and would be a reasonable model to use.  
+
+### Random Forest 
+Another model we can try is the random forest model. This model is not very interpretable, so needs to have a significantly better result in order to use over and above the logistic regression model. Once more our initial attempt will use all features of our dataset.
+
+```{r random_forest, include = TRUE}
+model_rf <- train(Survived ~ ., 
+                  data = bind_cols(train_y,df_train), 
+                  method = "rf", 
+                  prox = TRUE)
+
+df_train_predicted <- predict(model_rf, df_train)
+cm_rf_train <- confusionMatrix(data = df_train_predicted, 
+                               reference = train_y$Survived, 
+                               mode = "everything", 
+                               positive = "1")
+
+df_test_predicted <- predict(model_rf, df_test)
+cm_rf_test <- confusionMatrix(data = df_test_predicted, 
+                              reference = test_y$Survived, 
+                              mode = "everything", 
+                              positive = "1")
+model_rf
+```
+
+The accuracy of this model against the training and testing data is shown below, which is an improvement over what was achieved with the best logistic regression model.  
+
+|Dataset      |Accuracy|
+|-------------|--------|
+|Training     |`r cm_rf_train$overall[[1]]`|
+|Testing      |`r cm_rf_test$overall[[1]]`|
+
+However again we suspect that we might not need to use all features so we can look at the variable importance plot to see which features we might want to drop from the model:
+
+```{r varimp_2, include = TRUE}
+varimp_rf <- varImp(model_rf)
+plot(varimp_rf, main = "Variable Importance - Random Forest (all features)")
+```
+
+Again we see that the most important features are Sex, Age, Passenger Class and Family Size, although this time an additional feature for Fare is also deemed important to the model. Now we can do as before and generate models using the different features to see which has the highest accuracy:
+
+```{r random_forest_2}
+set.seed(2903)
+options(warn = -1)
+model_rf_1 <- train(Survived ~ Sex.female + Sex.male, 
+                     data = bind_cols(train_y,df_train), 
+                     method = "rf", 
+                     prox = TRUE)
+df_test_predicted <- predict(model_rf_1,df_test)
+cm_rf_1 <- confusionMatrix(data = df_test_predicted, 
+                          reference = test_y$Survived,
+                          mode = "everything",
+                          positive = "1")
+
+set.seed(2903)
+options(warn = -1)
+model_rf_2 <- train(Survived ~ Sex.female + Sex.male + Fare, 
+                     data = bind_cols(train_y,df_train), 
+                     method = "rf", 
+                     prox = TRUE)
+df_test_predicted <- predict(model_rf_2,df_test)
+cm_rf_2 <- confusionMatrix(data = df_test_predicted, 
+                          reference = test_y$Survived,
+                          mode = "everything",
+                          positive = "1")
+
+set.seed(2903)
+options(warn = -1)
+model_rf_3 <- train(Survived ~ Sex.female + Sex.male + Fare + Age, 
+                     data = bind_cols(train_y,df_train), 
+                     method = "rf", 
+                     prox = TRUE)
+df_test_predicted <- predict(model_rf_3,df_test)
+cm_rf_3 <- confusionMatrix(data = df_test_predicted, 
+                          reference = test_y$Survived,
+                          mode = "everything",
+                          positive = "1")
+
+set.seed(2903)
+options(warn = -1)
+model_rf_4 <- train(Survived ~ Sex.female + Sex.male + Fare + Age + Pclass, 
+                     data = bind_cols(train_y,df_train), 
+                     method = "rf", 
+                     prox = TRUE)
+df_train_predicted <- predict(model_rf_4,df_train)
+cm_rf_4_train <- confusionMatrix(data = df_train_predicted, 
+                                 reference = train_y$Survived,
+                                 mode = "everything",
+                                 positive = "1")
+df_test_predicted <- predict(model_rf_4,df_test)
+cm_rf_4_test <- confusionMatrix(data = df_test_predicted, 
+                                reference = test_y$Survived,
+                                mode = "everything",
+                                positive = "1")
+
+set.seed(2903)
+options(warn = -1)
+model_rf_5 <- train(Survived ~ Sex.female + Sex.male + Fare + Age + Pclass + FamSize, 
+                     data = bind_cols(train_y,df_train), 
+                     method = "rf", 
+                     prox = TRUE)
+df_test_predicted <- predict(model_rf_5,df_test)
+cm_rf_5 <- confusionMatrix(data = df_test_predicted, 
+                          reference = test_y$Survived,
+                          mode = "everything",
+                          positive = "1")
+```
+
+|Features in Model                                |Accuracy|
+|-------------------------------------------------|--------|
+|Sex                                              |`r cm_rf_1$overall[[1]]`|
+|Sex + Fare                                       |`r cm_rf_2$overall[[1]]`|
+|Sex + Fare + Age                                 |`r cm_rf_3$overall[[1]]`|
+|Sex + Fare + Age + Passenger Class               |`r cm_rf_4_test$overall[[1]]`| 
+|Sex + Fare + Age + Passenger Class + Family Size |`r cm_rf_5$overall[[1]]`|  
+
+It turns out the model with 4 features scores the highest, and this is higher than for the logistic regression model (at the expense of losing interpretability). Finally we will take a look at the accuracy for this model against both the training and testing datasets:  
+
+|Dataset      |Accuracy|
+|-------------|--------|
+|Training     |`r cm_rf_4_train$overall[[1]]`|
+|Testing      |`r cm_rf_4_test$overall[[1]]`|
+
+This shows a large discrepancy between the results achieved against the training data which is very high and the results achieved when applying the model to the testing data. This provides a little bit of doubt over the model which may still be subject to a degree of overfitting. Nonetheless the final accuracy figure is still impressive and an improvement on the logistic regression model.  
+
+### Extreme Gradient Boosting (XGBoost)
+The third model to try is the XGBoost model. As with the Random Forest model, the XGBoost algorithm uses multiple  trees but adds boosting capabilities such as Regularisation to (hopefully) come up with a more accurate result. This algorithm has a number of parameters that require tuning, but for the first iteration of the algorithm the default values are used. 
+
+```{r xgboost, include = TRUE}
+tune_grid <- expand.grid(
+    nrounds = 100 
+  , eta = 0.3 
+  , max_depth = 6 
+  , gamma = 0 
+  , colsample_bytree = 1
+  , min_child_weight = 1
+  , subsample = 1 
+)
+
+tune_control <- caret::trainControl(
+    method = "cv", 
+    number = 5,  
+    verboseIter = FALSE, 
+    allowParallel = TRUE  
+)
+
+set.seed(2903)
+model_xgb <- caret::train(
+    x = df_train,
+    y = train_y$Survived,
+    trControl = tune_control,
+    tuneGrid = tune_grid,
+    method = "xgbTree",
+    verbose = TRUE
+)
+
+df_train_predicted <- predict(model_xgb,df_train)
+cm_xgb_train <- confusionMatrix(data = df_train_predicted, 
+                                reference = train_y$Survived,
+                                mode = "everything",
+                                positive = "1")
+
+df_test_predicted <- predict(model_xgb,df_test)
+cm_xgb_test <- confusionMatrix(data = df_test_predicted, 
+                               reference = test_y$Survived,
+                               mode = "everything",
+                               positive = "1")
+
+model_xgb$bestTune
+
+```
+
+The resulting model has the following accuracy over the training and test datasets:  
+
+|Dataset                                          |Accuracy|
+|-------------------------------------------------|--------|
+|Training                                         |`r cm_xgb_train$overall[[1]]`|
+|Testing                                          |`r cm_xgb_test$overall[[1]]`|
+
+The feature importance is below:
+
+```{r varimp_xgb, include = TRUE}
+varimp_xgb <- varImp(model_xgb)
+plot(varimp_xgb, main = "Variable Importance - XGBoost")
+```
+
+As expected, the same variables as the other models feature most highly in the feature importance plot.  
+  
+We can see that the model has provided an accuracy measure against the test dataset which is not as good as the random forest model, but it looks like it can be improved through tuning. In particular we see a large disparity between the accuracy of the training dataset and the testing dataset which indicates that there has been a degree of overfitting. This can be improved by careful tuning of the regularisation and learning rate parameters; the results of which are below:  
+
+```{r xgboost_tuned, include = TRUE}
+tune_grid <- expand.grid(
+    nrounds = 100 
+  , eta = 0.5 
+  , max_depth = 6 
+  , gamma = 5 
+  , colsample_bytree = 1
+  , min_child_weight = 1
+  , subsample = 0.8 
+)
+
+tune_control <- caret::trainControl(
+    method = "cv", 
+    number = 5,  
+    verboseIter = FALSE, 
+    allowParallel = TRUE  
+)
+
+set.seed(2903)
+model_xgb_tuned <- caret::train(
+    x = df_train,
+    y = train_y$Survived,
+    trControl = tune_control,
+    tuneGrid = tune_grid,
+    method = "xgbTree",
+    verbose = TRUE
+)
+
+df_train_predicted <- predict(model_xgb_tuned,df_train)
+cm_xgb_tuned_train <- confusionMatrix(data = df_train_predicted, 
+                                      reference = train_y$Survived,
+                                      mode = "everything",
+                                      positive = "1")
+
+df_test_predicted <- predict(model_xgb_tuned,df_test)
+cm_xgb_tuned_test <- confusionMatrix(data = df_test_predicted, 
+                                     reference = test_y$Survived,
+                                     mode = "everything",
+                                     positive = "1")
+
+model_xgb_tuned$bestTune
+
+```
+
+The resulting model has the following accuracy over the training and testing datasets:  
+
+|Dataset                                          |Accuracy|
+|-------------------------------------------------|--------|
+|Training                                         |`r cm_xgb_tuned_train$overall[[1]]`|
+|Testing                                          |`r cm_xgb_tuned_test$overall[[1]]`|
+
+Here the results are much closer, indicating a better fitting model. Indeed this is now better than the results achieved with the random forest model.  
+
+## Conclusion
+There is an important quote to consider when evaluating models: "All models are wrong, some are useful". With this in mind we ought to be looking for the most useful model, but of course that depends on what we wish to use it for.  
+For example, if we wanted a model that explained how each feature impacted on the probability of one's survival on the Titanic then we would have chosen the Logistic Regression model which provided a reasonable accuracy rate. However in this project the objective was to find the model with the *best measure of accuracy*, and therefore the **XGBoost** model wins the day with an accuracy of **`r formattable::percent(cm_xgb_tuned_test$overall[[1]])`**.
